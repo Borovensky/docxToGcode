@@ -1268,10 +1268,39 @@ _MARKER_RE = re.compile(
     re.IGNORECASE,
 )
 
+#: Підпис командира зазвичай уже з нового рядка. «Командир N омбр» лишається
+#: ліворуч, прізвище — на тому ж рядку праворуч, звання «підполковник» —
+#: рядком нижче; після блоку додається один порожній рядок бланка.
+COMMANDER_GAP_LINES = 1
+_COMMANDER_NAME = r"(?:[A-Za-zА-Яа-яІіЇїЄєҐґ]\.)+|[^\s.,;:()]{2,}"
+_COMMANDER_RE = re.compile(
+    r"(?P<title>Командир\s+\d+\s+омбр)\s+"
+    r"(?P<rank>підполковник)\s+"
+    r"(?P<name>(?:(?:" + _COMMANDER_NAME + r")\s+){0,2}?(?:" + _COMMANDER_NAME + r"))"
+    r"(?:\.|(?=\s*\()|(?=\s*$))",
+    re.IGNORECASE,
+)
+
 
 def split_markers(text: str) -> list[str]:
     """Ріже текст на абзаци перед посиланнями на документ-джерело."""
     return [part.strip() for part in _MARKER_RE.split(text) if part.strip()]
+
+
+def iter_signature_parts(text: str):
+    """Чергує звичайний текст і підпис командира, щоб підпис почав новий рядок."""
+    pos = 0
+    for match in _COMMANDER_RE.finditer(text):
+        before = text[pos:match.start()].strip()
+        if before:
+            yield "text", before
+        yield "commander", match
+        pos = match.end()
+        if pos < len(text) and text[pos] == ".":
+            pos += 1
+    tail = text[pos:].strip()
+    if tail:
+        yield "text", tail
 
 
 def wrap_text(text: str, engine: FontEngine, width: float) -> list[str]:
@@ -1289,7 +1318,7 @@ def wrap_text(text: str, engine: FontEngine, width: float) -> list[str]:
             lines.append(current)
             current = word
     if current:
-        lines.append(current)
+        lines.append(current) 
 
     # Слово, довше за колонку, розбиваємо посимвольно.
     result: list[str] = []
@@ -1304,20 +1333,44 @@ def wrap_text(text: str, engine: FontEngine, width: float) -> list[str]:
     return result
 
 
-def wrap_record_text(
-    text: str, engine: FontEngine, width: float
-) -> list[tuple[str, bool]]:
-    """Рядки запису разом з ознакою «останній у своєму абзаці».
+@dataclass
+class BodyLine:
+    """Один рядок 3-ї колонки. Кілька фрагментів пишуться в тому ж рядку бланка."""
 
-    Абзац закінчується або перед наступною позначкою-джерелом, або в кінці
-    запису. Такий рядок не розтягується по ширині — інакше короткий «хвіст»
-    перед примусовим розривом розповзся б на всю колонку.
+    fragments: list[tuple[str, str]] = field(default_factory=list)  # (текст, align)
+    ends_paragraph: bool = False
+
+    @property
+    def is_blank(self) -> bool:
+        return not any(text for text, _align in self.fragments)
+
+
+def wrap_record_text(text: str, engine: FontEngine, width: float) -> list[BodyLine]:
+    """Рядки запису: звичайне перенесення, підпис командира, позначки-джерела.
+
+    Абзац закінчується перед позначкою-джерелом, після підпису командира
+    або в кінці запису. Такий рядок не розтягується по ширині — інакше
+    короткий «хвіст» перед примусовим розривом розповзся б на всю колонку.
     """
-    out: list[tuple[str, bool]] = []
-    for paragraph in split_markers(text):
-        lines = wrap_text(paragraph, engine, width)
-        for i, line in enumerate(lines):
-            out.append((line, i == len(lines) - 1))
+    out: list[BodyLine] = []
+    for kind, payload in iter_signature_parts(text):
+        if kind == "commander":
+            title = payload.group("title")
+            rank = payload.group("rank")
+            name = payload.group("name")
+            out.append(
+                BodyLine([(title, "left"), (name, "right")], ends_paragraph=True)
+            )
+            out.append(BodyLine([(rank, "left")], ends_paragraph=True))
+            for _ in range(COMMANDER_GAP_LINES):
+                out.append(BodyLine())
+            continue
+        for paragraph in split_markers(payload):
+            lines = wrap_text(paragraph, engine, width)
+            for i, line in enumerate(lines):
+                out.append(
+                    BodyLine([(line, "")], ends_paragraph=i == len(lines) - 1)
+                )
     return out
 
 
@@ -1328,7 +1381,7 @@ class PlacedLine:
     row: int
     column: int
     text: str
-    align: str = "left"  # left | center | justify
+    align: str = "left"  # left | center | justify | right
     is_last: bool = False
 
 
@@ -1372,25 +1425,32 @@ def layout(
         number += 1
 
         for i in range(needed):
+            body = body_lines[i] if i < len(body_lines) else None
+            is_blank = body is not None and body.is_blank
+
             if row >= rows_per_page:
+                if is_blank:
+                    continue
                 new_page()
                 page = pages[-1]
             if i == 0 and cfg.number_column:
                 page.lines.append(PlacedLine(row, 0, label, "center"))
             if i < len(record.date_lines):
                 page.lines.append(PlacedLine(row, 1, record.date_lines[i], "center"))
-            if i < len(body_lines):
-                text, ends_paragraph = body_lines[i]
+            if body is not None:
                 last = i == len(body_lines) - 1
-                page.lines.append(
-                    PlacedLine(
-                        row,
-                        2,
-                        text,
-                        "left" if (ends_paragraph or not cfg.justify) else "justify",
-                        is_last=last,
+                for text, align in body.fragments:
+                    if not text:
+                        continue
+                    if not align:
+                        align = (
+                            "left"
+                            if (body.ends_paragraph or not cfg.justify)
+                            else "justify"
+                        )
+                    page.lines.append(
+                        PlacedLine(row, 2, text, align, is_last=last)
                     )
-                )
             row += 1
 
     return [p for p in pages if p.lines]
@@ -1423,6 +1483,8 @@ def page_line_groups(
 
         if line.align == "center":
             x += (width - engine.text_width(text)) / 2.0
+        elif line.align == "right":
+            x += width - engine.text_width(text)
         elif line.align == "justify":
             spaces = text.count(" ")
             if spaces:
