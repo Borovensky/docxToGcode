@@ -110,7 +110,7 @@ class Config:
     offset_x: float = -6.0  # мм, загальний зсув тексту (мінус = ліворуч)
     offset_y: float = -3.0  # мм, загальний зсув тексту і сітки (мінус = вгору)
     date_offset_x: float = -2.0  # мм, додатковий зсув колонки дати
-    number_offset_x: float = -3.0  # мм, додатковий зсув колонки номерів
+    number_offset_x: float = -5.0  # мм, додатковий зсув колонки номерів
     baseline_offset: float = 0.0  # мм, ручне підстроювання базової лінії
     origin: str = "bottom-left"  # bottom-left | top-left
     mirror_x: bool = False
@@ -211,6 +211,26 @@ def _cell_paragraphs(tc: ET.Element) -> list[str]:
     return result
 
 
+#: Дата й час в одному абзаці колонки 2. Час відокремлюємо лише коли він іде
+#: одразу за датою; «(?!\.\d)» не дає прийняти за час початок другої дати
+#: («16.07.2026»), але лишає діапазон («04:36-04:38») цілим.
+_DATE_TIME_RE = re.compile(
+    r"^(\d{1,2}[.\-/]\d{1,2}[.\-/]\d{2,4})[,;]?\s+(\d{1,2}[:.]\d{2}(?!\.\d).*)$"
+)
+
+
+def split_date_time(lines: Iterable[str]) -> list[str]:
+    """Дата й час — завжди окремими рядками, як би їх не набрали в джерелі."""
+    result: list[str] = []
+    for line in lines:
+        match = _DATE_TIME_RE.match(line)
+        if match:
+            result.extend(match.groups())
+        else:
+            result.append(line)
+    return result
+
+
 @dataclass
 class SourceRecord:
     """Один запис (рядок) із заповненої таблиці."""
@@ -238,7 +258,7 @@ def read_source(path: Path) -> list[SourceRecord]:
                 continue
             texts = [_cell_paragraphs(tc) for tc in cells]
             number = " ".join(x.strip() for x in texts[0] if x.strip())
-            date_lines = [x.strip() for x in texts[1] if x.strip()]
+            date_lines = split_date_time(x.strip() for x in texts[1] if x.strip())
             main = " ".join(x.strip() for x in texts[2] if x.strip())
             note = " ".join(x.strip() for x in texts[3] if x.strip()) if len(texts) > 3 else ""
 
@@ -1229,6 +1249,31 @@ class FontEngine:
 # --------------------------------------------------------------------------------------
 
 
+#: Посилання на документ-джерело в тексті 3-ї колонки. Кожне починає новий
+#: рядок, щоб не губилося всередині абзацу. Регістр будь-який.
+LINE_BREAK_MARKERS = (
+    "розділ",
+    "бойове розпорядження",
+    "позатермінове",
+    "клопотання",
+    "розпорядження",
+    "БД",
+)
+
+#: Розрив ставимо перед дужкою, тому шукаємо позицію нульової ширини — сама
+#: дужка лишається на початку нового рядка. «\b» не дає зачепити слово, що лише
+#: починається з позначки («(розділів», «(розпорядженням»).
+_MARKER_RE = re.compile(
+    r"(?=\(\s*(?:" + "|".join(LINE_BREAK_MARKERS) + r")\b)",
+    re.IGNORECASE,
+)
+
+
+def split_markers(text: str) -> list[str]:
+    """Ріже текст на абзаци перед посиланнями на документ-джерело."""
+    return [part.strip() for part in _MARKER_RE.split(text) if part.strip()]
+
+
 def wrap_text(text: str, engine: FontEngine, width: float) -> list[str]:
     """Розбиває текст на рядки, що вміщуються в задану ширину."""
     words = text.split()
@@ -1257,6 +1302,23 @@ def wrap_text(text: str, engine: FontEngine, width: float) -> list[str]:
             line = line[cut:]
         result.append(line)
     return result
+
+
+def wrap_record_text(
+    text: str, engine: FontEngine, width: float
+) -> list[tuple[str, bool]]:
+    """Рядки запису разом з ознакою «останній у своєму абзаці».
+
+    Абзац закінчується або перед наступною позначкою-джерелом, або в кінці
+    запису. Такий рядок не розтягується по ширині — інакше короткий «хвіст»
+    перед примусовим розривом розповзся б на всю колонку.
+    """
+    out: list[tuple[str, bool]] = []
+    for paragraph in split_markers(text):
+        lines = wrap_text(paragraph, engine, width)
+        for i, line in enumerate(lines):
+            out.append((line, i == len(lines) - 1))
+    return out
 
 
 @dataclass
@@ -1296,7 +1358,7 @@ def layout(
         row = 0
 
     for record in records:
-        body_lines = wrap_text(record.text, engine, text_width)
+        body_lines = wrap_record_text(record.text, engine, text_width)
         needed = max(len(body_lines), len(record.date_lines), 1)
 
         if row >= rows_per_page:
@@ -1318,13 +1380,14 @@ def layout(
             if i < len(record.date_lines):
                 page.lines.append(PlacedLine(row, 1, record.date_lines[i], "center"))
             if i < len(body_lines):
+                text, ends_paragraph = body_lines[i]
                 last = i == len(body_lines) - 1
                 page.lines.append(
                     PlacedLine(
                         row,
                         2,
-                        body_lines[i],
-                        "justify" if (cfg.justify and not last) else "left",
+                        text,
+                        "left" if (ends_paragraph or not cfg.justify) else "justify",
                         is_last=last,
                     )
                 )
