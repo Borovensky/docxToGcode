@@ -107,18 +107,16 @@ class Config:
     # --- сторінка ---
     page_w: float = 294.0  # мм
     page_h: float = 210.0  # мм 
-    offset_x: float = -6.0  # мм, загальний зсув тексту (мінус = ліворуч)
-    offset_y: float = -3.0  # мм, загальний зсув тексту і сітки (мінус = вгору)
+    offset_x: float = 0.0  # мм, загальний зсув тексту (мінус = ліворуч)
+    offset_y: float = 0.0  # мм, загальний зсув тексту і сітки (мінус = вгору)
     date_offset_x: float = -2.0  # мм, додатковий зсув колонки дати
     number_offset_x: float = -5.0  # мм, додатковий зсув колонки номерів
     baseline_offset: float = 0.0  # мм, ручне підстроювання базової лінії
+    #: Нуль G-code — лівий нижній кут таблиці, не край аркуша. Тоді кожен
+    #: надрукований бланк виставляється на плотері по куту таблиці, і зсув
+    #: таблиці на папері більше не треба вгадувати.
     origin: str = "bottom-left"  # bottom-left | top-left
     mirror_x: bool = False
-    #: Додаток до offset_y для парних аркушів (2-го, 4-го…), мм; мінус = вгору.
-    #: Потрібен не через розкладку, а через друк: надрукований бланк парних
-    #: аркушів лежить на папері вище, ніж непарних, тому запис на них теж треба
-    #: підняти. Непарні аркуші не змінюються. 0 — усі аркуші однакові.
-    even_offset_y: float = -7.0
     #: Компенсація вертикального недоходу плотера: він проходить по Y трохи
     #: менше, ніж наказано, тому рядки поступово «утікають» угору від бланка —
     #: на першому збігаються, до кінця аркуша набігає майже цілий рядок.
@@ -301,6 +299,24 @@ class TableGeometry:
     def text_bounds(self, index: int) -> tuple[float, float]:
         left, right = self.col_bounds(index)
         return left + self.cell_margin_left, right - self.cell_margin_right
+
+    @property
+    def table_left(self) -> float:
+        return self.col_x[0]
+
+    @property
+    def table_right(self) -> float:
+        return self.col_x[-1]
+
+    @property
+    def table_top(self) -> float:
+        return self.margin_top
+
+    @property
+    def table_bottom(self) -> float:
+        if self.row_tops:
+            return self.row_tops[-1] + self.row_height
+        return self.margin_top
 
 
 def _font_line_metrics(query: str) -> dict:
@@ -1562,27 +1578,19 @@ def y_anchor(geo: TableGeometry, cfg: Config) -> float:
     return top + geo.baseline_in_row + cfg.offset_y
 
 
-def page_configs(pages_count: int, cfg: Config) -> list[Config]:
-    """Налаштування для кожного аркуша: парні зсунуті по Y, непарні — як є.
-
-    Зсув вносимо саме через offset_y, бо його враховують і текст, і сітка
-    бланка, і прив'язка вертикальної калібровки — аркуш зсувається цілком.
-    """
-    return [
-        cfg if i % 2 == 0 else replace(cfg, offset_y=cfg.offset_y + cfg.even_offset_y)
-        for i in range(pages_count)
-    ]
-
-
 def to_machine(pt: Point, geo: TableGeometry, cfg: Config) -> Point:
+    """Сторінкові координати → система плотера: (0, 0) — лівий нижній кут таблиці."""
     x, y = pt
     if cfg.scale_y != 1.0:
         anchor = y_anchor(geo, cfg)
         y = anchor + (y - anchor) * cfg.scale_y
+    x -= geo.table_left
     if cfg.mirror_x:
-        x = cfg.page_w - x
+        x = (geo.table_right - geo.table_left) - x
     if cfg.origin == "bottom-left":
-        y = cfg.page_h - y
+        y = geo.table_bottom - y
+    else:
+        y -= geo.table_top
     return x, y
 
 
@@ -1631,7 +1639,9 @@ def emit_gcode(
         a(f"; {title}")
         a(f"; font: {_ascii(cfg.font_query)} {_fmt(cfg.font_size_pt or geo.font_size_pt)}pt"
           f" mode={cfg.mode}")
-        a(f"; page: {_fmt(cfg.page_w)}x{_fmt(cfg.page_h)}mm origin={cfg.origin}")
+        a(f"; page: {_fmt(cfg.page_w)}x{_fmt(cfg.page_h)}mm origin=table-{cfg.origin}")
+        a(f"; table origin X0Y0 = left-bottom of table "
+          f"({_fmt(geo.table_left)},{_fmt(geo.table_bottom)} mm from page top-left)")
         a(f"; offset X{_fmt(cfg.offset_x)} Y{_fmt(cfg.offset_y)}"
           f" number X{_fmt(cfg.number_offset_x)} date X{_fmt(cfg.date_offset_x)}")
         if cfg.scale_y != 1.0:
@@ -1703,14 +1713,12 @@ def emit_gcode(
     return "\n".join(lines) + "\n", stats
 
 
-def emit_svg(pages: list[list[Polyline]], geo: TableGeometry, cfgs: Sequence[Config]) -> str:
+def emit_svg(pages: list[list[Polyline]], geo: TableGeometry, cfg: Config) -> str:
     """Прев'ю 1:1 у мм — можна роздрукувати й накласти на бланк.
 
-    Налаштування свої для кожного аркуша, бо парні зсунуті по Y: сітка бланка
-    має поїхати разом із текстом, інакше прев'ю показало б розбіжність, якої
-    на папері немає — там бланк парного аркуша й надрукований вище.
+    Координати прев'ю лишаються сторінковими (зверху-зліва аркуша), щоб його
+    можна було накласти на сам бланк. У G-code нуль — уже кут таблиці.
     """
-    cfg = cfgs[0]
     parts: list[str] = []
     total_h = cfg.page_h * len(pages)
     parts.append(
@@ -1725,7 +1733,7 @@ def emit_svg(pages: list[list[Polyline]], geo: TableGeometry, cfgs: Sequence[Con
             f'<rect x="0" y="0" width="{cfg.page_w}" height="{cfg.page_h}" '
             'fill="none" stroke="#cccccc" stroke-width="0.2"/>'
         )
-        for poly in grid_polylines(geo, cfgs[i]):
+        for poly in grid_polylines(geo, cfg):
             d = "M " + " L ".join(f"{x:.3f},{y:.3f}" for x, y in poly)
             parts.append(f'<path d="{d}" fill="none" stroke="#b0c4de" stroke-width="0.12"/>')
         for poly in polys:
@@ -1803,8 +1811,6 @@ def build_parser() -> argparse.ArgumentParser:
     g.add_argument("--offset-x", type=float, default=d.offset_x, help="загальний зсув по X, мм")
     g.add_argument("--offset-y", type=float, default=d.offset_y,
                    help="загальний зсув тексту і сітки по Y, мм (мінус = вгору)")
-    g.add_argument("--even-offset-y", type=float, default=d.even_offset_y,
-                   help="додаток до зсуву по Y для парних аркушів, мм (мінус = вгору, 0 — як непарні)")
     g.add_argument("--date-offset-x", type=float, default=d.date_offset_x, help="додатковий зсув колонки дати, мм")
     g.add_argument("--number-offset-x", type=float, default=d.number_offset_x,
                    help="додатковий зсув колонки номерів, мм (мінус = ліворуч)")
@@ -1877,7 +1883,6 @@ def config_from_args(args) -> Config:
         page_h=args.page_height,
         offset_x=args.offset_x,
         offset_y=args.offset_y,
-        even_offset_y=args.even_offset_y,
         date_offset_x=args.date_offset_x,
         number_offset_x=args.number_offset_x,
         baseline_offset=args.baseline_offset,
@@ -2060,20 +2065,18 @@ def main(argv: Sequence[str] | None = None) -> int:
     if not pages:
         raise SystemExit("Нічого розкладати.")
 
-    cfgs = page_configs(len(pages), cfg)
-
     rendered: list[list[Polyline]] = []
-    for page, page_cfg in zip(pages, cfgs):
-        groups = page_line_groups(page, geo, engine, page_cfg)
+    for page in pages:
+        groups = page_line_groups(page, geo, engine, cfg)
         # Оптимізація тільки всередині рядка: наскрізне перевпорядкування
         # шукає найближчий контур по всьому аркушу і перо починає блукати
         # між колонками замість того, щоб дописати рядок до кінця.
-        if page_cfg.optimize:
+        if cfg.optimize:
             groups = [optimize_order(g) for g in groups]
         polys = [p for g in groups for p in g]
-        if page_cfg.grid in ("calib", "full"):
-            grid = grid_polylines(geo, page_cfg)
-            polys = grid if page_cfg.grid == "calib" else grid + polys
+        if cfg.grid in ("calib", "full"):
+            grid = grid_polylines(geo, cfg)
+            polys = grid if cfg.grid == "calib" else grid + polys
         rendered.append(polys)
 
     if engine.missing:
@@ -2108,7 +2111,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     if cfg.single_file or len(rendered) == 1:
         chunks: list[str] = []
         for i, polys in enumerate(rendered):
-            text, stats = emit_gcode(polys, geo, cfgs[i], f"sheet {i + 1} of {len(rendered)}")
+            text, stats = emit_gcode(polys, geo, cfg, f"sheet {i + 1} of {len(rendered)}")
             for k in totals:
                 totals[k] += stats[k]
             if i:
@@ -2121,7 +2124,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         written.append(target)
     else:
         for i, polys in enumerate(rendered):
-            text, stats = emit_gcode(polys, geo, cfgs[i], f"sheet {i + 1} of {len(rendered)}")
+            text, stats = emit_gcode(polys, geo, cfg, f"sheet {i + 1} of {len(rendered)}")
             for k in totals:
                 totals[k] += stats[k]
             target = outdir / f"{stem}_p{i + 1:02d}.gcode"
@@ -2136,7 +2139,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     if cfg.write_preview:
         preview_path = cfg.preview or outdir / f"{stem}_preview.svg"
         preview_path.parent.mkdir(parents=True, exist_ok=True)
-        preview_path.write_text(emit_svg(rendered, geo, cfgs), "utf-8")
+        preview_path.write_text(emit_svg(rendered, geo, cfg), "utf-8")
 
     # --- звіт ---
     print(f"Записів: {len(records)}   аркушів: {len(rendered)}")
@@ -2145,14 +2148,11 @@ def main(argv: Sequence[str] | None = None) -> int:
           f"холостих ходів: {totals['travel_mm'] / 1000:.2f} м   "
           f"хід по Z: {totals['z_mm'] / 1000:.2f} м")
     print(f"Орієнтовний час: {totals['minutes']:.1f} хв")
+    print("Нуль плотера: лівий нижній кут таблиці — поставте цей кут бланка в X0 Y0")
     if cfg.scale_y != 1.0 and len(geo.row_tops) > 1:
         span = geo.row_tops[-1] - geo.row_tops[0]
         print(f"Калібровка по Y: ×{cfg.scale_y:.4f} — останній рядок опущено на "
               f"{span * (cfg.scale_y - 1):.2f} мм (прев'ю показує бланк без компенсації)")
-    if cfg.even_offset_y and len(rendered) > 1:
-        verb = "піднято" if cfg.even_offset_y < 0 else "опущено"
-        print(f"Парні аркуші: {verb} на {abs(cfg.even_offset_y):.2f} мм "
-              f"(offset_y {cfg.offset_y + cfg.even_offset_y:+.2f} проти {cfg.offset_y:+.2f})")
     if args.dry_run:
         print("(--dry-run: G-code не записано)")
     else:
