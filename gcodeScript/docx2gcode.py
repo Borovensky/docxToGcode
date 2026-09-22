@@ -53,6 +53,19 @@ DEFAULT_OUTPUT_DIR = "gcodeOutput"
 TWIPS_PER_MM = 1440.0 / 25.4  # 56.6929
 PT_PER_MM = 72.0 / 25.4  # 2.83465
 
+#: Ліміт файлів .gcode. Кегль підбирається так, щоб зайняти якомога більше
+#: аркушів, але не вийти за цей ліміт.
+DEFAULT_MAX_PAGES = 496
+
+#: Верхня межа кегля письма (як <w:sz> = 24 у Word — півпункти).
+MAX_FONT_SIZE_PT = 12.0
+MIN_FONT_SIZE_PT = 6.0
+FONT_SIZE_STEP_PT = 0.05
+
+
+def _snap_font_pt(size_pt: float) -> float:
+    return round(round(size_pt / FONT_SIZE_STEP_PT) * FONT_SIZE_STEP_PT, 2)
+
 #: Метрики Times New Roman на випадок, якщо шрифт не знайдено в системі.
 TNR_FALLBACK_METRICS = dict(upem=2048, ascent=1825, descent=443, line_gap=87)
 
@@ -89,7 +102,7 @@ class Config:
     font_path: Path | None = None
     font_index: int = 0
     fallback_font_query: str | None = None
-    font_size_pt: float | None = None  # None → взяти з файлу-джерела
+    font_size_pt: float | None = None  # None → взяти з файлу-джерела, не більше MAX_FONT_SIZE_PT
     smooth: float = 0.8  # згладжування сплайном, 0..1
     step: float = 0.4  # мм, крок дискретизації кривих
     corner_angle: float | None = None  # градуси; None → 50 для outline, 140 для centerline
@@ -136,6 +149,9 @@ class Config:
     justify: bool = True
     split_records: bool = True  # дозволяти розривати запис між аркушами
     max_rows: int | None = None  # None → з бланка
+    #: Ліміт файлів .gcode. Кегль зменшується (від 12 pt), доки журнал
+    #: не ввійде в цей ліміт. None або 0 — без обмеження.
+    max_pages: int | None = DEFAULT_MAX_PAGES
     grid: str = "none"  # none | calib | full
     optimize: bool = True  # перевпорядкування контурів для коротших холостих ходів
 
@@ -1114,6 +1130,26 @@ class FontEngine:
         self.fallback: FontEngine | None = None
         self.missing: set[str] = set()
 
+    def derive(self, size_pt: float) -> FontEngine:
+        """Той самий шрифт з іншим кеглем — без повторного читання TTF."""
+        if size_pt == self.size_pt:
+            return self
+        other = FontEngine.__new__(FontEngine)
+        other.path = self.path
+        other.cfg = replace(self.cfg, font_size_pt=size_pt)
+        other.size_pt = size_pt
+        other.font = self.font
+        other.glyph_set = self.glyph_set
+        other.cmap = self.cmap
+        other.upem = self.upem
+        other.hmtx = self.hmtx
+        other.scale = (size_pt / PT_PER_MM) / other.upem
+        other.kern = self.kern
+        other._glyph_cache = {}
+        other.missing = self.missing
+        other.fallback = self.fallback.derive(size_pt) if self.fallback is not None else None
+        return other
+
     # -- метрики -------------------------------------------------------------------
 
     def _load_kern(self) -> dict[tuple[str, str], int]:
@@ -1268,9 +1304,9 @@ _MARKER_RE = re.compile(
     re.IGNORECASE,
 )
 
-#: Підпис командира зазвичай уже з нового рядка. «Командир N омбр» лишається
-#: ліворуч, прізвище — на тому ж рядку праворуч, звання «підполковник» —
-#: рядком нижче; після блоку додається один порожній рядок бланка.
+#: Підпис командира зазвичай уже з нового рядка. «Командир N омбр» —
+#: окремий рядок ліворуч; звання «підполковник» ліворуч і прізвище
+#: праворуч — наступний рядок. Після блоку — порожній рядок.
 COMMANDER_GAP_LINES = 1
 _COMMANDER_NAME = r"(?:[A-Za-zА-Яа-яІіЇїЄєҐґ]\.)+|[^\s.,;:()]{2,}"
 _COMMANDER_RE = re.compile(
@@ -1303,9 +1339,54 @@ def iter_signature_parts(text: str):
         yield "text", tail
 
 
+#: Номер документа «N 231» / «№ 50445» — «N» і цифри не розриваємо між рядками.
+_DOC_NUM_RE = re.compile(
+    r"(?:N|№|No\.?)\s*\d+[.,;:]?",
+    re.IGNORECASE,
+)
+_DOC_MARK_RE = re.compile(r"^(N|№|No\.?)$", re.IGNORECASE)
+
+
+def wrap_tokens(text: str) -> list[str]:
+    """Слова для переносу: «N 231» лишається одним шматком."""
+    tokens: list[str] = []
+    pos = 0
+    for match in _DOC_NUM_RE.finditer(text):
+        tokens.extend(text[pos:match.start()].split())
+        tokens.append(re.sub(r"\s+", " ", match.group(0)).strip())
+        pos = match.end()
+    tokens.extend(text[pos:].split())
+    return tokens
+
+
+def _join_split_doc_nums(lines: list[str]) -> list[str]:
+    """Якщо рядок обірвався на «N», а наступний починається з номера — звести разом.
+
+    «N» переїжджає на вже існуючий наступний рядок. Нових рядків не зʼявляється.
+    """
+    if len(lines) < 2:
+        return lines
+    out = [lines[0]]
+    for nxt in lines[1:]:
+        prev = out[-1].rstrip()
+        head, sep, last = prev.rpartition(" ")
+        if not sep:
+            head, last = "", prev
+        rest = nxt.lstrip()
+        if _DOC_MARK_RE.fullmatch(last) and rest[:1].isdigit():
+            if head:
+                out[-1] = head
+                out.append(f"{last} {rest}")
+            else:
+                out[-1] = f"{last} {rest}"
+        else:
+            out.append(nxt)
+    return out
+
+
 def wrap_text(text: str, engine: FontEngine, width: float) -> list[str]:
     """Розбиває текст на рядки, що вміщуються в задану ширину."""
-    words = text.split()
+    words = wrap_tokens(text)
     if not words:
         return []
     lines: list[str] = []
@@ -1318,19 +1399,98 @@ def wrap_text(text: str, engine: FontEngine, width: float) -> list[str]:
             lines.append(current)
             current = word
     if current:
-        lines.append(current) 
+        lines.append(current)
 
-    # Слово, довше за колонку, розбиваємо посимвольно.
+    # Слово, довше за колонку, розбиваємо посимвольно — але не «N 231».
     result: list[str] = []
     for line in lines:
+        if _DOC_NUM_RE.fullmatch(line.strip()):
+            result.append(line)
+            continue
         while engine.text_width(line) > width and len(line) > 1:
             cut = len(line)
             while cut > 1 and engine.text_width(line[:cut]) > width:
                 cut -= 1
-            result.append(line[:cut])
-            line = line[cut:]
-        result.append(line)
-    return result
+            piece, rest = line[:cut], line[cut:].lstrip()
+            if _DOC_MARK_RE.fullmatch(piece.rstrip().rsplit(" ", 1)[-1]) and rest[:1].isdigit():
+                # Не лишати голе «N» на рядку — віддати номер разом униз.
+                head, sep, _mark = piece.rstrip().rpartition(" ")
+                if sep:
+                    result.append(head)
+                    line = f"{_mark} {rest}"
+                    continue
+            result.append(piece)
+            line = rest
+        if line:
+            result.append(line)
+    return _join_split_doc_nums(result)
+
+
+def wrap_text_at_least(
+    text: str, engine: FontEngine, width: float, min_lines: int
+) -> list[str]:
+    """Як wrap_text, але займає порожні рядки запису — хоча б одним словом.
+
+    Типовий випадок: дата й час уже взяли два рядки бланка, а текст ліг
+    в один — другий рядок колонки лишається порожнім. Трохи звужуємо
+    перенесення, щоб слово зʼїхало вниз; якщо не виходить рівно,
+    переносимо останні слова примусово.
+    """
+    lines = wrap_text(text, engine, width)
+    if min_lines <= 1 or len(lines) >= min_lines:
+        return lines
+    words = wrap_tokens(text)
+    if len(words) < 2:
+        return lines
+
+    for factor in (0.94, 0.88, 0.82, 0.76, 0.70, 0.62, 0.54, 0.45):
+        trial = wrap_text(text, engine, width * factor)
+        if len(trial) == min_lines:
+            return trial
+        if len(trial) > min_lines:
+            break
+    return _force_min_wrap_lines(lines, min_lines)
+
+
+def _force_min_wrap_lines(lines: list[str], min_lines: int) -> list[str]:
+    """Знімає слова з кінця на окремі рядки бланка, зберігаючи порядок."""
+    words = [w for line in lines for w in wrap_tokens(line)]
+    if len(words) < 2:
+        return lines
+    extra = min(max(min_lines - 1, 0), len(words) - 1)
+    if extra <= 0:
+        return lines
+    return _join_split_doc_nums([" ".join(words[:-extra])] + words[-extra:])
+
+
+def _fill_short_record(
+    body: list[BodyLine], engine: FontEngine, width: float, min_lines: int
+) -> list[BodyLine]:
+    """Дописує слова в порожні рядки, які вже зайняті датою/часом."""
+    content = [b for b in body if not b.is_blank]
+    if len(content) >= min_lines:
+        return body
+    if any(len(b.fragments) != 1 for b in content):
+        return body
+
+    last_para_start = 0
+    for i, line in enumerate(body):
+        if line.ends_paragraph and i < len(body) - 1:
+            last_para_start = i + 1
+    para = [b for b in body[last_para_start:] if not b.is_blank]
+    if not para or any(len(b.fragments) != 1 for b in para):
+        return body
+
+    other = len(content) - len(para)
+    need = min_lines - other
+    if need <= 1:
+        return body
+    text = " ".join(frag for b in para for frag, _align in b.fragments)
+    new_lines = wrap_text_at_least(text, engine, width, need)
+    return body[:last_para_start] + [
+        BodyLine([(line, "")], ends_paragraph=i == len(new_lines) - 1)
+        for i, line in enumerate(new_lines)
+    ]
 
 
 @dataclass
@@ -1358,10 +1518,10 @@ def wrap_record_text(text: str, engine: FontEngine, width: float) -> list[BodyLi
             title = payload.group("title")
             rank = payload.group("rank")
             name = payload.group("name")
+            out.append(BodyLine([(title, "left")], ends_paragraph=True))
             out.append(
-                BodyLine([(title, "left"), (name, "right")], ends_paragraph=True)
+                BodyLine([(rank, "left"), (name, "right")], ends_paragraph=True)
             )
-            out.append(BodyLine([(rank, "left")], ends_paragraph=True))
             for _ in range(COMMANDER_GAP_LINES):
                 out.append(BodyLine())
             continue
@@ -1390,11 +1550,37 @@ class Page:
     lines: list[PlacedLine] = field(default_factory=list)
 
 
+def _wrap_cache_key(rec_i: int, engine: FontEngine) -> tuple[int, float]:
+    """Ключ без id(): CPython повторно видає адреси GC-нутих двигунів."""
+    return rec_i, engine.size_pt
+
+
+def _wrapped_body(
+    rec_i: int,
+    record: SourceRecord,
+    engine: FontEngine,
+    text_width: float,
+    wrap_cache: dict[tuple[int, float], list[BodyLine]] | None,
+) -> list[BodyLine]:
+    cache_key = _wrap_cache_key(rec_i, engine)
+    if wrap_cache is not None and cache_key in wrap_cache:
+        return wrap_cache[cache_key]
+    body_lines = wrap_record_text(record.text, engine, text_width)
+    body_lines = _fill_short_record(
+        body_lines, engine, text_width, max(len(record.date_lines), 1)
+    )
+    if wrap_cache is not None:
+        wrap_cache[cache_key] = body_lines
+    return body_lines
+
+
 def layout(
     records: Sequence[SourceRecord],
     geo: TableGeometry,
     engine: FontEngine,
     cfg: Config,
+    *,
+    _wrap_cache: dict[tuple[int, float], list[BodyLine]] | None = None,
 ) -> list[Page]:
     """Розкладає записи по рядках бланка, повертає список аркушів."""
     text_left, text_right = geo.text_bounds(2)
@@ -1410,8 +1596,8 @@ def layout(
         pages.append(Page())
         row = 0
 
-    for record in records:
-        body_lines = wrap_record_text(record.text, engine, text_width)
+    for rec_i, record in enumerate(records):
+        body_lines = _wrapped_body(rec_i, record, engine, text_width, _wrap_cache)
         needed = max(len(body_lines), len(record.date_lines), 1)
 
         if row >= rows_per_page:
@@ -1454,6 +1640,125 @@ def layout(
             row += 1
 
     return [p for p in pages if p.lines]
+
+
+def _count_pages(
+    records: Sequence[SourceRecord],
+    geo: TableGeometry,
+    engine: FontEngine,
+    cfg: Config,
+    wrap_cache: dict[tuple[int, float], list[BodyLine]] | None = None,
+) -> int:
+    """Як layout, але лише кількість аркушів — для підбору кегля."""
+    text_left, text_right = geo.text_bounds(2)
+    text_width = text_right - text_left
+    row = 0
+    pages = 1
+    rows_per_page = geo.data_rows
+    filled = False
+
+    for rec_i, record in enumerate(records):
+        body_lines = _wrapped_body(rec_i, record, engine, text_width, wrap_cache)
+        needed = max(len(body_lines), len(record.date_lines), 1)
+
+        if row >= rows_per_page:
+            pages += 1
+            row = 0
+        if not cfg.split_records and row + needed > rows_per_page:
+            if needed <= rows_per_page:
+                pages += 1
+                row = 0
+
+        for i in range(needed):
+            body = body_lines[i] if i < len(body_lines) else None
+            is_blank = body is not None and body.is_blank
+            if row >= rows_per_page:
+                if is_blank:
+                    continue
+                pages += 1
+                row = 0
+            filled = True
+            row += 1
+
+    return pages if filled else 0
+
+
+@dataclass
+class FontFitInfo:
+    """Що змінили, щоб увійти в --max-pages."""
+
+    requested_pt: float
+    font_size_pt: float
+    pages: int
+    uncompressed_pages: int
+
+
+def fit_font_to_max_pages(
+    records: Sequence[SourceRecord],
+    geo: TableGeometry,
+    engine: FontEngine,
+    cfg: Config,
+) -> tuple[FontEngine, FontFitInfo, dict[tuple[int, float], list[BodyLine]]]:
+    """Найбільший кегль ≤ 12 pt, при якому аркушів не більше cfg.max_pages."""
+    requested_pt = min(engine.size_pt, MAX_FONT_SIZE_PT)
+    engine = engine.derive(requested_pt)
+    wrap_cache: dict[tuple[int, float], list[BodyLine]] = {}
+    start_pages = _count_pages(records, geo, engine, cfg, wrap_cache)
+    max_pages = cfg.max_pages
+
+    info = FontFitInfo(
+        requested_pt=requested_pt,
+        font_size_pt=requested_pt,
+        pages=start_pages,
+        uncompressed_pages=start_pages,
+    )
+    if max_pages is None or max_pages <= 0 or start_pages <= max_pages:
+        return engine, info, wrap_cache
+
+    lo = MIN_FONT_SIZE_PT
+    hi = requested_pt
+    lo_pages = _count_pages(records, geo, engine.derive(lo), cfg, wrap_cache)
+    if lo_pages > max_pages:
+        info.font_size_pt = lo
+        info.pages = lo_pages
+        return engine.derive(lo), info, wrap_cache
+
+    best = lo
+    best_pages = lo_pages
+    while hi - lo > FONT_SIZE_STEP_PT:
+        mid = _snap_font_pt((lo + hi) / 2.0)
+        mid = min(max(mid, lo), hi)
+        if mid == lo or mid == hi:
+            break
+        mid_pages = _count_pages(records, geo, engine.derive(mid), cfg, wrap_cache)
+        if mid_pages <= max_pages:
+            best, best_pages = mid, mid_pages
+            lo = mid
+        else:
+            hi = mid
+
+    best = _snap_font_pt(best)
+    best = max(MIN_FONT_SIZE_PT, min(best, requested_pt))
+    fitted = engine.derive(best)
+    best_pages = _count_pages(records, geo, fitted, cfg, wrap_cache)
+    while best_pages > max_pages and best > MIN_FONT_SIZE_PT + 1e-9:
+        best = _snap_font_pt(best - FONT_SIZE_STEP_PT)
+        best = max(best, MIN_FONT_SIZE_PT)
+        fitted = engine.derive(best)
+        best_pages = _count_pages(records, geo, fitted, cfg, wrap_cache)
+    while True:
+        nxt = _snap_font_pt(best + FONT_SIZE_STEP_PT)
+        if nxt > requested_pt + 1e-9:
+            break
+        nxt_pages = _count_pages(records, geo, engine.derive(nxt), cfg, wrap_cache)
+        if nxt_pages > max_pages:
+            break
+        best, best_pages = nxt, nxt_pages
+        fitted = engine.derive(best)
+
+    info.font_size_pt = best
+    info.pages = best_pages
+    return fitted, info, wrap_cache
 
 
 # --------------------------------------------------------------------------------------
@@ -1822,6 +2127,8 @@ def build_parser() -> argparse.ArgumentParser:
     g.add_argument("--no-justify", action="store_true", help="не вирівнювати текст по ширині")
     g.add_argument("--no-split", action="store_true", help="не розривати запис між аркушами")
     g.add_argument("--max-rows", type=int, default=d.max_rows, help="скільки рядків використовувати на аркуші")
+    g.add_argument("--max-pages", type=int, default=d.max_pages or 0,
+                   help="максимум файлів .gcode; кегль підбирається автоматично (не більше 12 pt, 0 — без ліміту)")
     g.add_argument("--grid", choices=["none", "calib", "full"], default=d.grid,
                    help="none — писати на надрукований бланк; calib — тільки сітка; full — сітка + текст")
     g.add_argument("--optimize", action="store_true",
@@ -1891,6 +2198,7 @@ def config_from_args(args) -> Config:
         justify=d.justify and not args.no_justify,
         split_records=d.split_records and not args.no_split,
         max_rows=args.max_rows,
+        max_pages=args.max_pages if args.max_pages and args.max_pages > 0 else None,
         grid=args.grid,
         optimize=(d.optimize or args.optimize) and not args.no_optimize,
         comments=d.comments and not args.no_comments,
@@ -2040,7 +2348,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             r.date_lines = [substitute_text(d) for d in r.date_lines]
 
     geo = read_template(template, cfg)
-    size_pt = cfg.font_size_pt or geo.font_size_pt
+    size_pt = min(cfg.font_size_pt or geo.font_size_pt, MAX_FONT_SIZE_PT)
     cfg = replace(cfg, font_size_pt=size_pt)
 
     engine = resolve_font(cfg, size_pt, args.rebuild_font_cache)
@@ -2056,7 +2364,17 @@ def main(argv: Sequence[str] | None = None) -> int:
                                         zip(geo.col_x, geo.col_x[1:])) + " мм")
         print(f"Шрифт:    {engine.path.name}  {size_pt:g} pt")
 
-    pages = layout(records, geo, engine, cfg)
+    engine, fit_info, wrap_cache = fit_font_to_max_pages(records, geo, engine, cfg)
+    cfg = replace(cfg, font_size_pt=engine.size_pt)
+    if cfg.verbose and fit_info.uncompressed_pages != fit_info.pages:
+        print(
+            f"Кегль:     {fit_info.requested_pt:g} → {fit_info.font_size_pt:g} pt  "
+            f"({fit_info.uncompressed_pages} → {fit_info.pages} аркушів, ліміт {cfg.max_pages})"
+        )
+    elif cfg.verbose:
+        print(f"Кегль:     {fit_info.font_size_pt:g} pt  ({fit_info.pages} аркушів)")
+
+    pages = layout(records, geo, engine, cfg, _wrap_cache=wrap_cache)
     if not pages:
         raise SystemExit("Нічого розкладати.")
 
@@ -2140,6 +2458,20 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     # --- звіт ---
     print(f"Записів: {len(records)}   аркушів: {len(rendered)}")
+    if fit_info.uncompressed_pages > fit_info.pages:
+        print(
+            f"Кегль підібрано під ліміт {cfg.max_pages} аркушів: "
+            f"{fit_info.requested_pt:g} → {fit_info.font_size_pt:g} pt "
+            f"({fit_info.uncompressed_pages} → {fit_info.pages})"
+        )
+    elif cfg.max_pages:
+        print(f"Кегль: {fit_info.font_size_pt:g} pt  (ліміт {cfg.max_pages} аркушів)")
+    if cfg.max_pages and len(rendered) > cfg.max_pages:
+        print(
+            f"Попередження: навіть при {fit_info.font_size_pt:g} pt вийшло "
+            f"{len(rendered)} аркушів (ліміт {cfg.max_pages}).",
+            file=sys.stderr,
+        )
     print(f"Контурів: {totals['contours']}   точок: {totals['points']}")
     print(f"Довжина письма: {totals['draw_mm'] / 1000:.2f} м   "
           f"холостих ходів: {totals['travel_mm'] / 1000:.2f} м   "
