@@ -28,9 +28,10 @@ DEFAULT_OUTPUT_DIR = "gcodeOutput"
 TWIPS_PER_MM = 1440.0 / 25.4  # 56.6929
 PT_PER_MM = 72.0 / 25.4  # 2.83465
 
-#: Ліміт файлів .gcode. Кегль підбирається так, щоб зайняти якомога більше
-#: аркушів, але не вийти за цей ліміт.
-DEFAULT_MAX_PAGES = 496
+#: Скільки файлів .gcode має вийти. Кегль зменшується, щоб не перевищити
+#: максимум. Якщо аркушів менше за мінімум — збільшується відстань між словами.
+DEFAULT_MAX_PAGES = 494
+DEFAULT_MIN_PAGES = 490
 
 #: Верхня межа кегля письма (як <w:sz> = 24 у Word — півпункти).
 MAX_FONT_SIZE_PT = 12.0
@@ -123,6 +124,9 @@ class Config:
     #: Ліміт файлів .gcode. Кегль зменшується (від 12 pt), доки журнал
     #: не ввійде в цей ліміт. None або 0 — без обмеження.
     max_pages: int | None = DEFAULT_MAX_PAGES
+    #: Нижня межа файлів .gcode. Якщо аркушів менше, росте word_spacing.
+    #: None або 0 — не розтягувати.
+    min_pages: int | None = DEFAULT_MIN_PAGES
     grid: str = "none"  # none | calib | full
     optimize: bool = True  # перевпорядкування контурів для коротших холостих ходів
 

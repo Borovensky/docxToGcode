@@ -116,6 +116,8 @@ def build_parser() -> argparse.ArgumentParser:
     g.add_argument("--max-rows", type=int, default=d.max_rows, help="скільки рядків використовувати на аркуші")
     g.add_argument("--max-pages", type=int, default=d.max_pages or 0,
                    help="максимум файлів .gcode; кегль підбирається автоматично (не більше 12 pt, 0 — без ліміту)")
+    g.add_argument("--min-pages", type=int, default=d.min_pages or 0,
+                   help="мінімум файлів .gcode; якщо менше — росте відстань між словами (0 — не розтягувати)")
     g.add_argument("--grid", choices=["none", "calib", "full"], default=d.grid,
                    help="none — писати на надрукований бланк; calib — тільки сітка; full — сітка + текст")
     g.add_argument("--optimize", action="store_true",
@@ -186,6 +188,7 @@ def config_from_args(args) -> Config:
         split_records=d.split_records and not args.no_split,
         max_rows=args.max_rows,
         max_pages=args.max_pages if args.max_pages and args.max_pages > 0 else None,
+        min_pages=args.min_pages if args.min_pages and args.min_pages > 0 else None,
         grid=args.grid,
         optimize=(d.optimize or args.optimize) and not args.no_optimize,
         comments=d.comments and not args.no_comments,
@@ -328,7 +331,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(f"Шрифт:    {engine.path.name}  {size_pt:g} pt")
 
     engine, fit_info, wrap_cache = fit_font_to_max_pages(records, geo, engine, cfg)
-    cfg = replace(cfg, font_size_pt=engine.size_pt)
+    cfg = replace(cfg, font_size_pt=engine.size_pt, word_spacing=engine.cfg.word_spacing)
     if cfg.verbose and fit_info.uncompressed_pages != fit_info.pages:
         print(
             f"Кегль:     {fit_info.requested_pt:g} → {fit_info.font_size_pt:g} pt  "
@@ -345,7 +348,12 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     rendered: list[list[Polyline]] = []
     for page, page_cfg in zip(pages, cfgs):
-        groups = page_line_groups(page, geo, engine, page_cfg)
+        page_engine = engine
+        if page.font_size_pt is not None:
+            page_engine = engine.derive(page.font_size_pt).with_word_spacing(
+                page.word_spacing if page.word_spacing is not None else engine.cfg.word_spacing
+            )
+        groups = page_line_groups(page, geo, page_engine, page_cfg)
         # Оптимізація тільки всередині рядка: наскрізне перевпорядкування
         # шукає найближчий контур по всьому аркушу і перо починає блукати
         # між колонками замість того, щоб дописати рядок до кінця.
@@ -429,6 +437,17 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
     elif cfg.max_pages:
         print(f"Кегль: {fit_info.font_size_pt:g} pt  (ліміт {cfg.max_pages} аркушів)")
+    if fit_info.word_spacing > 1e-9:
+        print(
+            f"Відстань між словами: +{fit_info.word_spacing:g} мм "
+            f"(аркушів {fit_info.pages}, діапазон {cfg.min_pages}–{cfg.max_pages})"
+        )
+    if cfg.min_pages and len(rendered) < cfg.min_pages:
+        print(
+            f"Попередження: навіть при відстані між словами +{fit_info.word_spacing:g} мм "
+            f"вийшло {len(rendered)} аркушів (мінімум {cfg.min_pages}).",
+            file=sys.stderr,
+        )
     if cfg.max_pages and len(rendered) > cfg.max_pages:
         print(
             f"Попередження: навіть при {fit_info.font_size_pt:g} pt вийшло "

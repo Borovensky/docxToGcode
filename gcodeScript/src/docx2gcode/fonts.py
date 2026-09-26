@@ -203,9 +203,24 @@ class FontEngine:
         """Той самий шрифт з іншим кеглем — без повторного читання TTF."""
         if size_pt == self.size_pt:
             return self
+        other = self._clone(size_pt=size_pt, word_spacing=self.cfg.word_spacing)
+        other.fallback = self.fallback.derive(size_pt) if self.fallback is not None else None
+        return other
+
+    def with_word_spacing(self, word_spacing: float) -> FontEngine:
+        """Той самий кегль, інша додаткова ширина пробілу."""
+        if word_spacing == self.cfg.word_spacing:
+            return self
+        other = self._clone(size_pt=self.size_pt, word_spacing=word_spacing)
+        other.fallback = (
+            self.fallback.with_word_spacing(word_spacing) if self.fallback is not None else None
+        )
+        return other
+
+    def _clone(self, size_pt: float, word_spacing: float) -> FontEngine:
         other = FontEngine.__new__(FontEngine)
         other.path = self.path
-        other.cfg = replace(self.cfg, font_size_pt=size_pt)
+        other.cfg = replace(self.cfg, font_size_pt=size_pt, word_spacing=word_spacing)
         other.size_pt = size_pt
         other.font = self.font
         other.glyph_set = self.glyph_set
@@ -216,7 +231,7 @@ class FontEngine:
         other.kern = self.kern
         other._glyph_cache = {}
         other.missing = self.missing
-        other.fallback = self.fallback.derive(size_pt) if self.fallback is not None else None
+        other.fallback = None
         return other
 
     # -- метрики -------------------------------------------------------------------
