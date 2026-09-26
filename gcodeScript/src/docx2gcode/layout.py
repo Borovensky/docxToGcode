@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import re
+import sys
 from dataclasses import dataclass, field
 from typing import Sequence
 
@@ -14,30 +15,50 @@ from .config import (
     FONT_SIZE_STEP_PT,
     MAX_FONT_SIZE_PT,
     MIN_FONT_SIZE_PT,
+    PROJECT_DIR,
     Config,
     snap_font_pt,
 )
 from .docx import SourceRecord, TableGeometry
 from .fonts import FontEngine
 
-#: Посилання на документ-джерело в тексті 3-ї колонки. Кожне починає новий
-#: рядок, щоб не губилося всередині абзацу. Регістр будь-який.
-LINE_BREAK_MARKERS = (
-    "розділ",
-    "бойове розпорядження",
-    "позатермінове",
-    "клопотання",
-    "розпорядження",
-    "БД",
-)
+_LOCAL_CONFIG = PROJECT_DIR / "local_config.toml"
 
-#: Розрив ставимо перед дужкою, тому шукаємо позицію нульової ширини — сама
-#: дужка лишається на початку нового рядка. «\b» не дає зачепити слово, що лише
-#: починається з позначки («(розділів», «(розпорядженням»).
-_MARKER_RE = re.compile(
-    r"(?=\(\s*(?:" + "|".join(LINE_BREAK_MARKERS) + r")\b)",
-    re.IGNORECASE,
-)
+
+def _line_break_markers() -> tuple[str, ...]:
+    """Позначки з local_config.toml поруч із бланком. Немає файлу — немає розривів.
+
+    Пошкоджений файл або поле не того типу зупиняє програму.
+    """
+    if not _LOCAL_CONFIG.is_file():
+        return ()
+    if sys.version_info < (3, 11):
+        raise SystemExit(f"Щоб прочитати {_LOCAL_CONFIG.name}, потрібен Python 3.11+.")
+    import tomllib
+
+    try:
+        with _LOCAL_CONFIG.open("rb") as fh:
+            data = tomllib.load(fh)
+    except tomllib.TOMLDecodeError as exc:
+        raise SystemExit(f"Не вдалося прочитати {_LOCAL_CONFIG}: {exc}") from exc
+    if "markers" not in data:
+        raise SystemExit(f"{_LOCAL_CONFIG}: немає поля «markers».")
+    markers = data["markers"]
+    if not isinstance(markers, list) or not all(isinstance(item, str) for item in markers):
+        raise SystemExit(f"{_LOCAL_CONFIG}: «markers» має бути списком рядків.")
+    return tuple(item for item in markers if item)
+
+
+def _compile_marker_re() -> re.Pattern[str]:
+    """Розрив перед дужкою, тож дужка лишається на початку нового рядка."""
+    markers = _line_break_markers()
+    if not markers:
+        return re.compile(r"(?!)")
+    body = "|".join(re.escape(item) for item in markers)
+    return re.compile(rf"(?=\(\s*(?:{body})\b)", re.IGNORECASE)
+
+
+_MARKER_RE = _compile_marker_re()
 
 #: Підпис командира зазвичай уже з нового рядка. «Командир N омбр» —
 #: окремий рядок ліворуч; звання «підполковник» ліворуч і прізвище

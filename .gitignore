@@ -5,3 +5,7 @@ gcodeOutput/
 .DS_Store
 __pycache__/
 .venv/
+
+# Бланк і локальні правила розкладки.
+gcodeScript/1 лист.docx
+gcodeScript/local_config.toml
