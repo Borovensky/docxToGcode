@@ -117,13 +117,17 @@ def y_anchor(geo: TableGeometry, cfg: Config) -> float:
 
 
 def page_configs(pages_count: int, cfg: Config) -> list[Config]:
-    """Налаштування для кожного аркуша: парні зсунуті по Y, непарні — як є.
+    """Налаштування для кожного аркуша: парні зсунуті по X і Y, непарні — як є.
 
-    Зсув вносимо саме через offset_y, бо його враховують і текст, і сітка
+    Зсув вносимо через offset_x і offset_y, бо їх враховують і текст, і сітка
     бланка, і прив'язка вертикальної калібровки — аркуш зсувається цілком.
     """
     return [
-        cfg if i % 2 == 0 else replace(cfg, offset_y=cfg.offset_y + cfg.even_offset_y)
+        cfg if i % 2 == 0 else replace(
+            cfg,
+            offset_x=cfg.offset_x + cfg.even_offset_x,
+            offset_y=cfg.offset_y + cfg.even_offset_y,
+        )
         for i in range(pages_count)
     ]
 
@@ -260,9 +264,9 @@ def emit_gcode(
 def emit_svg(pages: list[list[Polyline]], geo: TableGeometry, cfgs: Sequence[Config]) -> str:
     """Прев'ю 1:1 у мм — можна роздрукувати й накласти на бланк.
 
-    Налаштування свої для кожного аркуша, бо парні зсунуті по Y: сітка бланка
-    має поїхати разом із текстом, інакше прев'ю показало б розбіжність, якої
-    на папері немає — там бланк парного аркуша й надрукований вище.
+    Налаштування свої для кожного аркуша, бо парні зсунуті по X і Y: сітка
+    бланка має поїхати разом із текстом, інакше прев'ю показало б розбіжність,
+    якої на папері немає — там бланк парного аркуша надрукований інакше.
     """
     cfg = cfgs[0]
     parts: list[str] = []

@@ -266,10 +266,7 @@ class BodyLine:
 
 
 def is_commander_signature(text: str) -> bool:
-    """Запис, у якому немає тексту крім підпису командира.
-
-    Такому рядку не ставимо номер у крайній лівій колонці.
-    """
+    """Запис, у якому немає тексту крім підпису командира."""
     parts = list(iter_signature_parts(text))
     return bool(parts) and all(kind == "commander" for kind, _payload in parts)
 
@@ -414,14 +411,11 @@ def layout(
         fixed_rows = 0
 
     def take_label(record: SourceRecord, num: int) -> tuple[str, int, bool]:
+        """Номер лише з колонки джерела. Порожня клітинка лишається порожньою."""
         explicit = record.number.strip()
-        hide = is_commander_signature(record.text)
-        if hide:
+        if not explicit:
             return "", num, True
-        if explicit:
-            nxt = int(explicit) + 1 if explicit.isdigit() else num
-            return explicit, nxt, False
-        return str(num), num + 1, False
+        return explicit, num, False
 
     def place_lines(
         rec_i: int,

@@ -102,7 +102,11 @@ def read_source(path: Path) -> list[SourceRecord]:
 
     records: list[SourceRecord] = []
     for tbl in body.findall(W + "tbl"):
-        for tr in tbl.findall(W + "tr"):
+        for index, tr in enumerate(tbl.findall(W + "tr")):
+            # Перший рядок — шапка бланка. Її текст уже надрукований,
+            # у запис і далі в G-code він не потрапляє.
+            if index == 0:
+                continue
             cells = tr.findall(W + "tc")
             if len(cells) < 3:
                 continue
@@ -237,25 +241,27 @@ def read_template(path: Path, cfg: Config) -> TableGeometry:
     natural_line_mm = template_font_pt / PT_PER_MM * line_factor
     baseline_mm = template_font_pt / PT_PER_MM * ascent_factor
 
-    # Висоти рядків: Word бере max(вказана висота, висота вмісту).
+    # Висоти рядків: якщо в бланку задано <w:trHeight>, Word бере max(вона, вміст).
+    # Якщо ні — шапка 12 мм, кожен наступний рядок 5 мм.
     rows = tbl.findall(W + "tr")
     heights: list[float] = []
-    lines_per_row: list[int] = []
-    for tr in rows:
+    for index, tr in enumerate(rows):
         tr_pr = tr.find(W + "trPr")
-        spec = 0.0
+        spec: float | None = None
         rule = "atLeast"
         if tr_pr is not None:
             h_el = tr_pr.find(W + "trHeight")
-            if h_el is not None:
+            if h_el is not None and _attr(h_el, "val"):
                 spec = mm_from_twips(float(_attr(h_el, "val") or 0))
                 rule = _attr(h_el, "hRule") or "atLeast"
+        if spec is None:
+            heights.append(12.0 if index == 0 else 5.0)
+            continue
         max_paras = 1
         for tc in tr.findall(W + "tc"):
             max_paras = max(max_paras, max(1, len(tc.findall(W + "p"))))
         content = natural_line_mm * max_paras
         heights.append(spec if rule == "exact" else max(spec, content))
-        lines_per_row.append(max_paras)
 
     # Рядки-заголовки — ті, що містять текст; далі йдуть порожні рядки для запису.
     if cfg.header_rows is not None:

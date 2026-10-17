@@ -95,6 +95,8 @@ def build_parser() -> argparse.ArgumentParser:
     g.add_argument("--offset-x", type=float, default=d.offset_x, help="загальний зсув по X, мм")
     g.add_argument("--offset-y", type=float, default=d.offset_y,
                    help="загальний зсув тексту і сітки по Y, мм (мінус = вгору)")
+    g.add_argument("--even-offset-x", type=float, default=d.even_offset_x,
+                   help="додаток до зсуву по X для парних аркушів, мм (мінус = ліворуч, 0 — як непарні)")
     g.add_argument("--even-offset-y", type=float, default=d.even_offset_y,
                    help="додаток до зсуву по Y для парних аркушів, мм (мінус = вгору, 0 — як непарні)")
     g.add_argument("--date-offset-x", type=float, default=d.date_offset_x, help="додатковий зсув колонки дати, мм")
@@ -173,6 +175,7 @@ def config_from_args(args) -> Config:
         page_h=args.page_height,
         offset_x=args.offset_x,
         offset_y=args.offset_y,
+        even_offset_x=args.even_offset_x,
         even_offset_y=args.even_offset_y,
         date_offset_x=args.date_offset_x,
         number_offset_x=args.number_offset_x,
@@ -463,10 +466,21 @@ def main(argv: Sequence[str] | None = None) -> int:
         span = geo.row_tops[-1] - geo.row_tops[0]
         print(f"Калібровка по Y: ×{cfg.scale_y:.4f} — останній рядок опущено на "
               f"{span * (cfg.scale_y - 1):.2f} мм (прев'ю показує бланк без компенсації)")
-    if cfg.even_offset_y and len(rendered) > 1:
-        verb = "піднято" if cfg.even_offset_y < 0 else "опущено"
-        print(f"Парні аркуші: {verb} на {abs(cfg.even_offset_y):.2f} мм "
-              f"(offset_y {cfg.offset_y + cfg.even_offset_y:+.2f} проти {cfg.offset_y:+.2f})")
+    if len(rendered) > 1 and (cfg.even_offset_x or cfg.even_offset_y):
+        parts = []
+        if cfg.even_offset_x:
+            verb = "ліворуч" if cfg.even_offset_x < 0 else "праворуч"
+            parts.append(
+                f"{verb} на {abs(cfg.even_offset_x):.2f} мм "
+                f"(offset_x {cfg.offset_x + cfg.even_offset_x:+.2f} проти {cfg.offset_x:+.2f})"
+            )
+        if cfg.even_offset_y:
+            verb = "вгору" if cfg.even_offset_y < 0 else "вниз"
+            parts.append(
+                f"{verb} на {abs(cfg.even_offset_y):.2f} мм "
+                f"(offset_y {cfg.offset_y + cfg.even_offset_y:+.2f} проти {cfg.offset_y:+.2f})"
+            )
+        print("Парні аркуші: " + ", ".join(parts))
     if args.dry_run:
         print("(--dry-run: G-code не записано)")
     else:
