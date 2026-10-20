@@ -79,8 +79,21 @@ def split_markers(text: str) -> list[str]:
     return [part.strip() for part in _MARKER_RE.split(text) if part.strip()]
 
 
-def iter_signature_parts(text: str):
+_SIGNATURE_TIME_RE = re.compile(r"^23[:.]59$")
+
+
+def has_signature_time(date_lines: Sequence[str]) -> bool:
+    """Підпис ставимо лише коли в другій колонці час рівно 23:59."""
+    return any(_SIGNATURE_TIME_RE.fullmatch(line.strip()) for line in date_lines)
+
+
+def iter_signature_parts(text: str, *, allow_signature: bool = True):
     """Чергує звичайний текст і підпис командира, щоб підпис почав новий рядок."""
+    if not allow_signature:
+        stripped = text.strip()
+        if stripped:
+            yield "text", stripped
+        return
     pos = 0
     for match in _COMMANDER_RE.finditer(text):
         before = text[pos:match.start()].strip()
@@ -265,16 +278,20 @@ class BodyLine:
         return not any(text for text, _align in self.fragments)
 
 
-def is_commander_signature(text: str) -> bool:
-    """Запис, у якому немає тексту крім підпису командира.
+def is_commander_signature(text: str, date_lines: Sequence[str]) -> bool:
+    """Запис, у якому немає тексту крім підпису командира о 23:59.
 
     Такому рядку не ставимо номер у крайній лівій колонці.
     """
+    if not has_signature_time(date_lines):
+        return False
     parts = list(iter_signature_parts(text))
     return bool(parts) and all(kind == "commander" for kind, _payload in parts)
 
 
-def wrap_record_text(text: str, engine: FontEngine, width: float) -> list[BodyLine]:
+def wrap_record_text(
+    text: str, engine: FontEngine, width: float, *, allow_signature: bool = True
+) -> list[BodyLine]:
     """Рядки запису: звичайне перенесення, підпис командира, позначки-джерела.
 
     Абзац закінчується перед позначкою-джерелом, після підпису командира
@@ -282,7 +299,7 @@ def wrap_record_text(text: str, engine: FontEngine, width: float) -> list[BodyLi
     короткий «хвіст» перед примусовим розривом розповзся б на всю колонку.
     """
     out: list[BodyLine] = []
-    for kind, payload in iter_signature_parts(text):
+    for kind, payload in iter_signature_parts(text, allow_signature=allow_signature):
         if kind == "commander":
             title = payload.group("title")
             rank = payload.group("rank")
@@ -342,7 +359,12 @@ def _wrapped_body(
     cache_key = _wrap_cache_key(rec_i, engine)
     if wrap_cache is not None and cache_key in wrap_cache:
         return wrap_cache[cache_key]
-    body_lines = wrap_record_text(record.text, engine, text_width)
+    body_lines = wrap_record_text(
+        record.text,
+        engine,
+        text_width,
+        allow_signature=has_signature_time(record.date_lines),
+    )
     body_lines = _fill_short_record(
         body_lines, engine, text_width, max(len(record.date_lines), 1)
     )
@@ -415,7 +437,7 @@ def layout(
 
     def take_label(record: SourceRecord, num: int) -> tuple[str, int, bool]:
         explicit = record.number.strip()
-        hide = is_commander_signature(record.text)
+        hide = is_commander_signature(record.text, record.date_lines)
         if hide:
             return "", num, True
         if explicit:
@@ -547,7 +569,7 @@ def layout(
         for rec_i, record in grouped:
             body = _wrapped_body(rec_i, record, eng, text_width, _wrap_cache)
             needed = max(len(body), len(record.date_lines), 1)
-            entry = not is_commander_signature(record.text)
+            entry = not is_commander_signature(record.text, record.date_lines)
             for i in range(needed):
                 line = body[i] if i < len(body) else None
                 blank = line is not None and line.is_blank
